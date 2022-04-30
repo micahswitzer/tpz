@@ -7,11 +7,14 @@ pub fn sendFile(name: []const u8, contents: []const u8) !void {
     // open socket
     const sock = try std.net.tcpConnectToAddress(LOCALHOST);
     defer sock.close();
-    const writer = sock.writer();
-    const reader = sock.reader();
+    var writer_buf = std.io.bufferedWriter(sock.writer());
+    var reader_buf = std.io.bufferedReader(sock.reader());
+    const writer = writer_buf.writer();
+    const reader = reader_buf.reader();
     // send init packet
     const initPacket = proto.initPacket(name, contents.len, .{});
     try initPacket.write(writer);
+    try writer_buf.flush();
     // read response
     const initResp = try proto.Packet.read(reader);
     std.log.info("{?}", .{initResp});
@@ -27,6 +30,7 @@ pub fn sendFile(name: []const u8, contents: []const u8) !void {
         const finishPacket = proto.dataPacket(&[0]u8{}, 0);
         try finishPacket.write(writer);
     }
+    try writer_buf.flush();
     std.log.info("File sent", .{});
 }
 
