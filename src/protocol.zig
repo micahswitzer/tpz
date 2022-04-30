@@ -75,6 +75,8 @@ pub const Version = struct {
     minor: u16,
     patch: u16,
 
+    const SIZE: u32 = 3 * 2;
+
     pub fn write(self: *const @This(), writer: anytype) !void {
         try writer.writeIntLittle(u16, self.major);
         try writer.writeIntLittle(u16, self.minor);
@@ -88,13 +90,13 @@ pub const Version = struct {
             .patch = try reader.readIntLittle(u16),
         };
     }
+
+    pub fn isSupported(self: *const @This()) bool {
+        return self.major == DEFAULT_VERSION.major and self.minor == DEFAULT_VERSION.minor;
+    }
 };
 
-pub fn version() Version {
-    return Version{ .major = 0, .minor = 9, .patch = 5 };
-}
-
-pub const DEFAULT_VERSION = version();
+pub const DEFAULT_VERSION = Version{ .major = 0, .minor = 9, .patch = 5 };
 
 pub const Init = struct {
     pub const FEATURE = struct {
@@ -106,7 +108,7 @@ pub const Init = struct {
     };
 
     version: Version = DEFAULT_VERSION,
-    features: u32 = FEATURE.NEW_FILE,
+    features: u32,
     permissions: u32,
     filesize: u64,
     filename: []const u8,
@@ -130,6 +132,10 @@ pub const Init = struct {
         };
         res.filename = try reader.readAllAlloc(alloc, res.filesize);
         return res;
+    }
+
+    pub fn size(self: *const @This()) u32 {
+        return Version.SIZE + 4 + 4 + 8 + 2 + @intCast(u16, self.filename.len);
     }
 };
 
@@ -161,14 +167,123 @@ pub const InitAck = struct {
 
     status: Status,
     version: Version,
-    features: ?u32 = null,
+    features: ?u32,
     delta: ?Delta = null,
+
+    pub fn size(self: *const @This()) u32 {
+        return 1 + Version.SIZE + if (self.features) |_| @as(u32, 4) else 0;
+    }
+
+    fn read(reader: anytype) !@This() {
+        const status = try std.meta.intToEnum(Status, try reader.readByte());
+        const version = try Version.read(reader);
+        if (!version.isSupported())
+            return error.VersionUnsupported;
+        const features = try reader.readIntLittle(u32);
+        return @This(){
+            .status = status,
+            .version = version,
+            .features = features,
+        };
+    }
 };
 
 pub const Data = struct {
     offset: u64,
     data: []const u8,
+
+    fn size(self: *const @This()) u32 {
+        return 8 + 4 + @intCast(u32, self.data.len);
+    }
+
+    fn write(self: *const @This(), writer: anytype) !void {
+        try writer.writeIntLittle(u64, self.offset);
+        try writer.writeIntLittle(u32, @intCast(u32, self.data.len));
+        try writer.writeAll(self.data);
+    }
 };
+
+pub const Packet = union(enum) {
+    init: Init,
+    init_ack: InitAck,
+    data: Data,
+    delta,
+    ecdh,
+    ecdh_ack,
+
+    const Self = @This();
+
+    pub fn action(self: Self, is_encrypted: bool) u8 {
+        return switch (self) {
+            .init => ACTION.INIT,
+            .init_ack => ACTION.INIT_ACK,
+            .data => ACTION.DATA,
+            .delta => ACTION.DATA,
+            .ecdh => ACTION.ECDH,
+            .ecdh_ack => ACTION.ECDH_ACK,
+        } | if (is_encrypted) ACTION.ENCRYPTED else 0;
+    }
+
+    pub fn write(self: Self, writer: anytype) !void {
+        const payload_size = switch (self) {
+            Self.init => |init| init.size(),
+            Self.init_ack => |init_ack| init_ack.size(),
+            Self.data => |data| data.size(),
+            else => 0,
+        };
+        try writer.writeIntLittle(u64, Header.PROTOCOL);
+        try writer.writeIntLittle(u32, payload_size);
+        try writer.writeByte(self.action(false));
+        switch (self) {
+            Self.init => |init| try init.write(writer),
+            //Self.init_ack => |init_ack| try init_ack.write(writer),
+            Self.data => |data| try data.write(writer),
+            else => return error.UnsupportedAction,
+        }
+    }
+
+    pub fn read(reader: anytype) !Packet {
+        if ((try reader.readIntLittle(u64)) != Header.PROTOCOL)
+            return error.BadProtocol;
+        const dataLength = try reader.readIntLittle(u32);
+        _ = dataLength; // who needs this value?
+        const actionKind = try reader.readByte();
+        if (actionKind & ACTION.ENCRYPTED == ACTION.ENCRYPTED)
+            return error.EncryptionUnsupported;
+        switch (actionKind) {
+            ACTION.INIT_ACK => return Packet{ .init_ack = try InitAck.read(reader) },
+            //ACTION.DATA => return Packet{ .data = try Data.read(reader) },
+            else => return error.UnknownAction,
+        }
+
+        unreachable;
+    }
+};
+
+pub const FileOptions = struct {
+    features: u32 = Init.FEATURE.NEW_FILE,
+    permissions: u32 = 0o644,
+};
+
+pub fn initPacket(filename: []const u8, filesize: u64, options: FileOptions) Packet {
+    return Packet{
+        .init = Init{
+            .filename = filename,
+            .filesize = filesize,
+            .features = options.features,
+            .permissions = options.permissions,
+        },
+    };
+}
+
+pub fn dataPacket(data: []const u8, offset: u64) Packet {
+    return Packet{
+        .data = Data{
+            .data = data,
+            .offset = offset,
+        },
+    };
+}
 
 pub const ACTION = struct {
     pub const INIT: u8 = 0x01;
