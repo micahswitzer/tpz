@@ -1,54 +1,182 @@
 const std = @import("std");
 
 pub const Header = struct {
-    const PROTOCOL = std.mem.bytesToValue(u64, "TELEPORT");
-    const IV_LEN = 12;
+    pub const PROTOCOL = std.mem.bytesToValue(u64, "TELEPORT");
+    pub const BASE_LEN = 8 + 4 + 1;
+    pub const IV_LEN = 12;
 
     action: u8,
     iv: ?[IV_LEN]u8 = null,
-    data: []const u8 = &[0]u8{},
+    data: ?[]const u8 = null,
+
+    pub fn dataLen(self: *const @This()) u32 {
+        return if (self.data) |data| @intCast(u32, data.len) else 0;
+    }
 
     pub fn write(self: *const @This(), writer: anytype) !void {
-        try writer.writeIntLittle(u64, @This().PROTOCOL);
-        try writer.writeIntLittle(u32, @intCast(u32, self.data.len));
+        try writer.writeIntLittle(u64, PROTOCOL);
+        try writer.writeIntLittle(u32, self.dataLen());
         try writer.writeByte(self.action | if (self.iv) |_| ACTION.ENCRYPTED else 0);
         if (self.iv) |*iv|
             try writer.writeAll(iv);
-        try writer.writeAll(self.data);
+        if (self.data) |data|
+            try writer.writeAll(data);
     }
 
-    pub fn readAlloc(alloc: std.mem.Allocator, reader: anytype) !@This() {
-        if ((try reader.readIntLittle(u64)) != @This().PROTOCOL)
+    const Ret = std.meta.Tuple(&.{ @This(), u32 });
+    fn readRaw(reader: anytype) !Ret {
+        if ((try reader.readIntLittle(u64)) != PROTOCOL)
             return error.BadProtocol;
         const dataLength = try reader.readIntLittle(u32);
         const action = try reader.readByte();
-        const iv = blk: {
-            if (action & ACTION.ENCRYPTED == ACTION.ENCRYPTED) {
-                break :blk try reader.readBytesNoEof(@This().IV_LEN);
-            } else {
-                break :blk null;
-            }
-        };
-        const data = try reader.readAllAlloc(alloc, dataLength);
-        return @This(){
+        const iv = if (action & ACTION.ENCRYPTED == ACTION.ENCRYPTED)
+            try reader.readBytesNoEof(IV_LEN)
+        else
+            null;
+        const res = @This(){
             .action = action,
             .iv = iv,
-            .data = data,
+            .data = null,
         };
+        return Ret{ res, dataLength };
+    }
+
+    pub fn readEmpty(reader: anytype) !@This() {
+        const raw = try readRaw(reader);
+        if (raw.@"1" != 0)
+            return error.NotEmpty;
+        return raw.@"0";
+    }
+
+    pub fn readAlloc(alloc: std.mem.Allocator, reader: anytype) !@This() {
+        var raw = try readRaw(reader);
+        const new: *@This() = &raw.@"0";
+        if (raw.@"1" > 0) {
+            var buf = try alloc.alloc(u8, raw.@"1");
+            try reader.readNoEof(buf);
+            new.data = buf;
+        }
+        return new.*;
     }
 
     pub fn serializedSize(self: *const @This()) usize {
-        return (8 + 4 + 1) + if (self.iv) |_| 12 else 0 + self.data.len;
+        return BASE_LEN + if (self.iv) |_| IV_LEN else 0 + self.dataLen();
+    }
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.data) |data|
+            alloc.free(data);
+        self.* = undefined;
     }
 };
 
+pub const Version = struct {
+    major: u16,
+    minor: u16,
+    patch: u16,
+
+    pub fn write(self: *const @This(), writer: anytype) !void {
+        try writer.writeIntLittle(u16, self.major);
+        try writer.writeIntLittle(u16, self.minor);
+        try writer.writeIntLittle(u16, self.patch);
+    }
+
+    pub fn read(reader: anytype) !@This() {
+        return @This(){
+            .major = try reader.readIntLittle(u16),
+            .minor = try reader.readIntLittle(u16),
+            .patch = try reader.readIntLittle(u16),
+        };
+    }
+};
+
+pub fn version() Version {
+    return Version{ .major = 0, .minor = 9, .patch = 5 };
+}
+
+pub const DEFAULT_VERSION = version();
+
+pub const Init = struct {
+    pub const FEATURE = struct {
+        pub const NEW_FILE = 0x01;
+        pub const DELTA = 0x02;
+        pub const OVERWRITE = 0x04;
+        pub const BACKUP = 0x08;
+        pub const RENAME = 0x10;
+    };
+
+    version: Version = DEFAULT_VERSION,
+    features: u32 = FEATURE.NEW_FILE,
+    permissions: u32,
+    filesize: u64,
+    filename: []const u8,
+
+    pub fn write(self: *const @This(), writer: anytype) !void {
+        try self.version.write(writer);
+        try writer.writeIntLittle(u32, self.features);
+        try writer.writeIntLittle(u32, self.permissions);
+        try writer.writeIntLittle(u64, self.filesize);
+        try writer.writeIntLittle(u16, @intCast(u16, self.filename.len));
+        try writer.writeAll(self.filename);
+    }
+
+    pub fn read(alloc: std.mem.Allocator, reader: anytype) !@This() {
+        var res = @This(){
+            .version = try Version.read(reader),
+            .features = try reader.readIntLittle(u32),
+            .permissions = try reader.readIntLittle(u32),
+            .filesize = try reader.readIntLittle(u64),
+            .filename = undefined,
+        };
+        res.filename = try reader.readAllAlloc(alloc, res.filesize);
+        return res;
+    }
+};
+
+pub fn newFile(name: []const u8, size: u64, permissions: u32) Init {
+    return Init{
+        .filename = name,
+        .filesize = size,
+        .permissions = permissions,
+    };
+}
+
+pub const Delta = struct {
+    filesize: u64,
+    hash: u64,
+    chunk_size: u32,
+    chunk_hash: []const u64,
+};
+
+pub const InitAck = struct {
+    pub const Status = enum {
+        proceed,
+        no_overwrite,
+        no_space,
+        no_permission,
+        wrong_version,
+        encryption_error,
+        unknown_action,
+    };
+
+    status: Status,
+    version: Version,
+    features: ?u32 = null,
+    delta: ?Delta = null,
+};
+
+pub const Data = struct {
+    offset: u64,
+    data: []const u8,
+};
+
 pub const ACTION = struct {
-    const INIT: u8 = 0x01;
-    const INIT_ACK: u8 = 0x02;
-    const ECDH: u8 = 0x04;
-    const ECDH_ACK: u8 = 0x08;
-    const DATA: u8 = 0x40;
-    const ENCRYPTED: u8 = 0x80;
+    pub const INIT: u8 = 0x01;
+    pub const INIT_ACK: u8 = 0x02;
+    pub const ECDH: u8 = 0x04;
+    pub const ECDH_ACK: u8 = 0x08;
+    pub const DATA: u8 = 0x40;
+    pub const ENCRYPTED: u8 = 0x80;
 };
 
 // comptime known init packet
@@ -73,9 +201,9 @@ test "new header" {
 test "parse packet" {
     const alloc = std.testing.allocator;
     var stream = std.io.fixedBufferStream(INIT_PACKET);
-    const packet = try Header.readAlloc(alloc, stream.reader());
-    defer alloc.free(packet.data);
+    var packet = try Header.readAlloc(alloc, stream.reader());
+    defer packet.deinit(alloc);
     try std.testing.expectEqual(packet.action, ACTION.INIT);
     try std.testing.expectEqual(packet.iv, null);
-    try std.testing.expectEqual(packet.data.len, 0);
+    try std.testing.expectEqual(packet.data, null);
 }
