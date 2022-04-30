@@ -55,7 +55,7 @@ pub const Init = struct {
         try writer.writeAll(self.filename);
     }
 
-    fn read(alloc: std.mem.Allocator, reader: anytype) !@This() {
+    fn read(alloc: std.mem.Allocator, reader: anytype, _: u32) !@This() {
         var res = @This(){
             .version = try Version.read(reader),
             .features = try reader.readIntLittle(u32),
@@ -99,12 +99,12 @@ pub const InitAck = struct {
         return 1 + Version.SIZE + if (self.features) |_| @as(u32, 4) else 0;
     }
 
-    fn read(reader: anytype) !@This() {
+    fn read(reader: anytype, available: u32) !@This() {
         const status = try std.meta.intToEnum(Status, try reader.readByte());
         const version = try Version.read(reader);
         if (!version.isSupported())
             return error.VersionUnsupported;
-        const features = try reader.readIntLittle(u32);
+        const features = if (available > 1 + Version.SIZE) try reader.readIntLittle(u32) else null;
         return @This(){
             .status = status,
             .version = version,
@@ -179,13 +179,12 @@ pub const Packet = union(enum) {
     pub fn read(reader: anytype) !Packet {
         if ((try reader.readIntLittle(u64)) != PROTOCOL)
             return error.BadProtocol;
-        const dataLength = try reader.readIntLittle(u32);
-        _ = dataLength; // who needs this value?
-        const actionKind = try reader.readByte();
-        if (actionKind & ACTION.ENCRYPTED == ACTION.ENCRYPTED)
+        const data_length = try reader.readIntLittle(u32);
+        const action_kind = try reader.readByte();
+        if (action_kind & ACTION.ENCRYPTED == ACTION.ENCRYPTED)
             return error.EncryptionUnsupported;
-        switch (actionKind) {
-            ACTION.INIT_ACK => return Packet{ .init_ack = try InitAck.read(reader) },
+        switch (action_kind) {
+            ACTION.INIT_ACK => return Packet{ .init_ack = try InitAck.read(reader, data_length) },
             //ACTION.DATA => return Packet{ .data = try Data.read(reader) },
             else => return error.UnknownAction,
         }
